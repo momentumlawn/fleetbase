@@ -1,16 +1,17 @@
 services:
   cache:
     image: redis:4-alpine
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks: [internal]
 
   database:
     image: mysql:8.0-oracle
-    ports:
-      - "3306:3306"
+    restart: unless-stopped
     volumes:
       - "./docker/database/:/docker-entrypoint-initdb.d/"
       - "./docker/database/mysql:/var/lib/mysql"
@@ -22,17 +23,26 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks: [internal]
 
   socket:
     image: socketcluster/socketcluster:v17.4.0
-    ports:
-      - "38000:8000"
+    restart: unless-stopped
     environment:
       SOCKETCLUSTER_WORKERS: 10
       SOCKETCLUSTER_BROKERS: 10
+    networks: [internal, infra_edge]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=infra_edge
+      - traefik.http.routers.fleetbase-socket.entrypoints=websecure
+      - traefik.http.routers.fleetbase-socket.rule=Host(`${FLEETBASE_SOCKET_HOST}`)
+      - traefik.http.routers.fleetbase-socket.tls=true
+      - traefik.http.services.fleetbase-socket.loadbalancer.server.port=8000
 
   scheduler:
     image: fleetbase/fleetbase-api:latest
+    restart: unless-stopped
     command: ["go-crond", "--verbose", "root:./crontab"]
     environment:
       DATABASE_URL: "mysql://root@database/fleetbase"
@@ -41,12 +51,15 @@ services:
       CACHE_PATH: /fleetbase/api/storage/framework/cache
       CACHE_URL: tcp://cache
       REDIS_URL: tcp://cache
-    depends_on:
-      - database
-      - cache
+      SOCKETCLUSTER_HOST: socket
+      SOCKETCLUSTER_PORT: 8000
+      SOCKETCLUSTER_SECURE: "false"
+    depends_on: [database, cache]
+    networks: [internal]
 
   queue:
     image: fleetbase/fleetbase-api:latest
+    restart: unless-stopped
     command: ["php", "artisan", "queue:work"]
     healthcheck:
       test: ["CMD", "php", "artisan", "queue:status"]
@@ -60,19 +73,29 @@ services:
       CACHE_PATH: /fleetbase/api/storage/framework/cache
       CACHE_URL: tcp://cache
       REDIS_URL: tcp://cache
-    depends_on:
-        - database
-        - cache
+      SOCKETCLUSTER_HOST: socket
+      SOCKETCLUSTER_PORT: 8000
+      SOCKETCLUSTER_SECURE: "false"
+    depends_on: [database, cache]
+    networks: [internal]
 
   console:
     image: fleetbase/fleetbase-console:latest
-    ports:
-      - "4200:4200"
+    restart: unless-stopped
     volumes:
       - ./console/fleetbase.config.json:/usr/share/nginx/html/fleetbase.config.json
+    networks: [internal, infra_edge]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=infra_edge
+      - traefik.http.routers.fleetbase-console.entrypoints=websecure
+      - traefik.http.routers.fleetbase-console.rule=Host(`${FLEETBASE_CONSOLE_HOST}`)
+      - traefik.http.routers.fleetbase-console.tls=true
+      - traefik.http.services.fleetbase-console.loadbalancer.server.port=4200
 
   application:
     image: fleetbase/fleetbase-api:latest
+    restart: unless-stopped
     volumes:
       - ./api/.env:/fleetbase/api/.env
     environment:
@@ -83,24 +106,51 @@ services:
       CACHE_PATH: /fleetbase/api/storage/framework/cache
       CACHE_URL: tcp://cache
       REDIS_URL: tcp://cache
-      SESSION_DOMAIN: localhost
+
+      # CORS / console awareness
+      CONSOLE_HOST: https://${FLEETBASE_CONSOLE_HOST}
+      FRONTEND_HOSTS: https://${FLEETBASE_CONSOLE_HOST}
+
+      # sockets (API talks to socket internally)
       BROADCAST_DRIVER: socketcluster
+      SOCKETCLUSTER_HOST: socket
+      SOCKETCLUSTER_PORT: 8000
+      SOCKETCLUSTER_SECURE: "false"
+
       MAIL_FROM_NAME: Fleetbase
       APP_NAME: Fleetbase
       LOG_CHANNEL: daily
       REGISTRY_HOST: https://registry.fleetbase.io
       REGISTRY_PREINSTALLED_EXTENSIONS: 'true'
       OSRM_HOST: https://router.project-osrm.org
-    depends_on:
-      - database
-      - cache
-      - queue
+      SESSION_DOMAIN: ${SESSION_DOMAIN:-localhost}
+    depends_on: [database, cache, queue]
+    networks: [internal]
 
   httpd:
     build:
       context: .
       dockerfile: docker/httpd/Dockerfile
-    ports:
-      - "8000:80"
-    depends_on:
-      - application
+    restart: unless-stopped
+    depends_on: [application]
+    networks: [internal, infra_edge]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=infra_edge
+      - traefik.http.routers.fleetbase.entrypoints=websecure
+      - traefik.http.routers.fleetbase.rule=Host(`${FLEETBASE_HTTPD_HOST}`)
+      - traefik.http.routers.fleetbase.tls=true
+      - traefik.http.services.fleetbase.loadbalancer.server.port=80
+      # Optional (if your Traefik uses a named certresolver, e.g. "le"):
+      # - traefik.http.routers.fleetbase.tls.certresolver=le
+      # - traefik.http.routers.fleetbase-console.tls.certresolver=le
+      # - traefik.http.routers.fleetbase-socket.tls.certresolver=le
+
+networks:
+  internal:
+    name: fleetbase_internal
+    driver: bridge
+    internal: true
+  infra_edge:
+    external: true
+    name: infra_edge
